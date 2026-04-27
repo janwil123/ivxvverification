@@ -71,36 +71,52 @@ reduc forall m: bitstring, sk: skey; signer_pk(sign(m, sk)) = pk(sk).
  * container and recovered during verification (container/bdoc/xades.go). *)
 
 free skE: skey [private].
-free skV: skey [private].
-(* skV: the voter's signing key, used for both session authentication (via
- * its public key on the auth channel) and BDOC container signing.  In the
- * real system there are two separate keys with the same Estonian personal ID
- * code; the single-key simplification is noted above. *)
-free b0: ballot [private].
-free rV: rand [private].
+(* skE: the shared election secret key.  One key covers all voters; the
+ * election public key pk(skE) is a public parameter. *)
 
-event VoterSent(bitstring, sig).
-event Accepted(bitstring, voteid).
+event HonestVoterKey(pkey).
+(* HonestVoterKey(spk): spk is the public key of an honest voter session.
+ * Fired immediately after the session's fresh skV is generated, before any
+ * network interaction.  Used in the query to scope the correspondence to
+ * honest sessions only, distinguishing them from corrupted voter sessions
+ * whose keys the attacker may know. *)
+event VoterSent(pkey, bitstring, sig).
+(* VoterSent(spk, c, s): the voter whose signing key is spk computed ciphertext
+ * c and submitted it under signature s. *)
+event Accepted(pkey, bitstring, voteid).
+(* Accepted(spk, c, vid): the Collector accepted ciphertext c, attributed the
+ * submission to signer key spk, and assigned fresh VoteID vid. *)
 
-(* Claim C3: if the Collector accepted a ballot under some freshly generated
- * VoteID, the voter's signing key (skV) was used to create the signature,
- * AND the BDOC signer identity matched the session-authenticated identity.
- * The `vid: voteid` variable is universally quantified: the claim holds for
- * every fresh VoteID the Collector may generate. *)
-query vid: voteid;
-  event(Accepted(enc(b0, rV, pk(skE)), vid)) ==>
-  event(VoterSent(enc(b0, rV, pk(skE)), sign(pack_cipher(enc(b0, rV, pk(skE))), skV))).
+(* Claim C3: if the Collector accepted a ciphertext attributed to an honest
+ * voter's key spk, then a voter session with that key actually sent it.
+ * The left-hand side conditions on HonestVoterKey(spk): ciphertexts accepted
+ * under corrupted voters' keys are outside the claim and do not falsify it.
+ * The attacker can submit arbitrary ciphertexts under corrupted keys, but
+ * cannot cause the Collector to accept a ciphertext under an honest voter's
+ * key without that voter's participation, because auth is private. *)
+query spk: pkey, c: bitstring, s: sig, vid: voteid;
+  event(Accepted(spk, c, vid)) && event(HonestVoterKey(spk)) ==>
+  event(VoterSent(spk, c, s)).
 
 let Voter =
+  (* Each voter session gets its own fresh private signing key, ballot, and
+   * encryption randomness.  This models the real system where every eligible
+   * voter holds a distinct key pair from the Estonian PKI and independently
+   * samples fresh ElGamal randomness.  Moving these inside the replicated
+   * process prevents sessions from sharing key material. *)
+  new skV: skey;
+  new b: ballot;
+  new rV: rand;
+  event HonestVoterKey(pk(skV));
   (* Step 1: authenticate the session.
    * The voter presents their public key as their session identity (auther).
    * In the real protocol this is derived from the TLS/ticket authentication
    * certificate (voting/main.go:101). *)
   out(auth, pk(skV));
   (* Step 2: encrypt the ballot and sign the BDOC container. *)
-  let c = enc(b0, rV, pk(skE)) in
+  let c = enc(b, rV, pk(skE)) in
   let s = sign(pack_cipher(c), skV) in
-  event VoterSent(c, s);
+  event VoterSent(pk(skV), c, s);
   out(net, (c, s));
   (* Step 3: receive the freshly generated VoteID from the Collector. *)
   in(net, vid_resp: voteid).
@@ -125,10 +141,22 @@ let Collector =
       (* Generate a fresh VoteID and return it in the RPC response.
        * Corresponds to voting/main.go:171-178 (genIdent or pre-set token). *)
       new vid_i: voteid;
-      event Accepted(c_i, vid_i);
+      event Accepted(spk, c_i, vid_i);
       out(net, vid_i)
     else 0
   else 0.
 
+let CorruptedVoter =
+  (* Model a voter whose signing key is known to the attacker.
+   * The fresh skV is generated honestly, but immediately leaked on net so
+   * the attacker can forge signatures and compute the corresponding public key.
+   * A session identity is also placed on auth so the attacker can submit
+   * under this key through the Collector's authentication channel.
+   * HonestVoterKey is NOT fired, so the Claim C3 query does not cover ballots
+   * accepted under this key: the correspondence holds only for honest sessions. *)
+  new skV: skey;
+  out(net, skV);
+  out(auth, pk(skV)).
+
 process
-  Voter | Collector
+  !Voter | !CorruptedVoter | !Collector

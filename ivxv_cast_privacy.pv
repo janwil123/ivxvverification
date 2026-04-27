@@ -7,21 +7,45 @@
  * The model uses a biprocess via choice[b0,b1], so a positive result is an
  * observational-equivalence style privacy argument in the symbolic model.
  *
- * IMPROVEMENT from previous version:
+ * IMPROVEMENTS from previous version:
  *
- * Qualification data in RPC response (voting/main.go:199-273):
- *   The real RPC response includes a Qualification field containing OCSP/TSP
- *   responses collected after storing the vote.  This qualification data is
- *   tied to the voter's certificate validity (not the ballot content), so it
- *   does not reveal the choice.  We model it as a fresh opaque token `qual`
- *   independent of the ballot, and include it in the output to reflect the
- *   actual response shape.  Both branches of the biprocess generate qual
- *   independently with `new`, so observational equivalence is unaffected.
+ * 1. Qualification data in RPC response (voting/main.go:199-273):
+ *    The real RPC response includes a Qualification field containing OCSP/TSP
+ *    responses collected after storing the vote.  This qualification data is
+ *    tied to the voter's certificate validity (not the ballot content), so it
+ *    does not reveal the choice.  We model it as a fresh opaque token `qual`
+ *    independent of the ballot, and include it in the output to reflect the
+ *    actual response shape.  Both branches of the biprocess generate qual
+ *    independently with `new`, so observational equivalence is unaffected.
+ *
+ * 2. Multiple voters and voter corruption:
+ *    The previous model had a single honest voter with a global signing key.
+ *    The model now has three kinds of participants running in parallel:
+ *
+ *    TargetVoter (one instance):
+ *      The voter whose ballot choice is under scrutiny.  Uses choice[b0,b1]
+ *      to produce the biprocess.  Has a fresh signing key and randomness so
+ *      no key material is shared with other sessions.
+ *
+ *    OtherVoter (replicated):
+ *      Additional honest voters casting their own fresh ballots.  Each session
+ *      generates a fresh key, ballot, and randomness independently.  The fresh
+ *      ballot name is the same abstract value in both biprocess worlds, so
+ *      other honest voters contribute no distinguishing information.
+ *
+ *    CorruptedVoter (replicated):
+ *      A voter whose signing key and encryption randomness are both leaked to
+ *      the attacker.  This is the strongest corruption model for privacy: the
+ *      attacker can recompute the corrupted voter's ciphertext from (b, rV,
+ *      pk(skE)) and confirm the ballot.  The claim is that even with corrupted
+ *      voters present the target voter's two worlds remain indistinguishable.
  *
  * Remaining abstractions:
  *   - BDOC/XAdES container structure (pack_cipher is a simplification)
  *   - OCSP/TSP response content (qual is opaque; timing information omitted)
  *   - Session authentication not modeled (focus is on encryption randomness)
+ *   - The eligibility check and collector-side storage are not modeled;
+ *     only the voter-side cast message is produced.
  *)
 
 type skey.
@@ -41,11 +65,23 @@ fun pack_cipher(bitstring): bitstring.
 reduc forall m: bitstring, sk: skey; verify_sig(sign(m, sk), pk(sk)) = m.
 
 free skE: skey [private].
-free skV: skey [private].
-free b0: ballot [private].
-free b1: ballot [private].
+(* skE: the shared election secret key.  One key covers all voters; the
+ * election public key pk(skE) is a public parameter. *)
+free b0: ballot.
+free b1: ballot.
+(* b0, b1: the two specific ballot choices being compared.  In the real system
+ * the candidate list is published, so the attacker knows every valid ballot
+ * value.  Making b0 and b1 public reflects this: the claim is that even an
+ * attacker who knows both candidates cannot determine which one was encrypted.
+ * This is the correct IND-CPA style formulation.  Marking them [private]
+ * would state a weaker property (the attacker does not even know the options).
+ * All other per-voter values (keys, randomness, other ballots) are fresh. *)
 
-process
+let TargetVoter =
+  (* The voter whose privacy is being argued.  One instance only; uses
+   * choice[b0,b1] to create the biprocess.  Everything except the ballot
+   * choice is fresh and independent of b0/b1. *)
+  new skV: skey;
   new rV: rand;
   new vid: voteid;
   new qual: bitstring;
@@ -56,4 +92,40 @@ process
   let c = enc(b, rV, pk(skE)) in
   let msg = pack_cipher(c) in
   let s = sign(msg, skV) in
-  out(net, (vid, c, s, qual))
+  out(net, (vid, c, s, qual)).
+
+let OtherVoter =
+  (* An additional honest voter.  The fresh ballot name `b` is generated
+   * independently in each biprocess world and is the same abstract value in
+   * both (it is just a fresh name, not b0 or b1), so it contributes no
+   * distinguishing information between the two worlds. *)
+  new skV: skey;
+  new b: ballot;
+  new rV: rand;
+  new vid: voteid;
+  new qual: bitstring;
+  let c = enc(b, rV, pk(skE)) in
+  let msg = pack_cipher(c) in
+  let s = sign(msg, skV) in
+  out(net, (vid, c, s, qual)).
+
+let CorruptedVoter =
+  (* A voter whose key and encryption randomness are both known to the
+   * attacker.  This is the strongest corruption model for a privacy argument:
+   * the attacker receives skV (and can therefore forge signatures) and rV
+   * (and can therefore recompute enc(b, rV, pk(skE)) to confirm the ballot).
+   * Even so, the TargetVoter's fresh rV and skV remain unaffected, so the
+   * two biprocess worlds for the target stay indistinguishable. *)
+  new skV: skey;
+  new b: ballot;
+  new rV: rand;
+  new vid: voteid;
+  out(net, skV);
+  out(net, rV);
+  let c = enc(b, rV, pk(skE)) in
+  let msg = pack_cipher(c) in
+  let s = sign(msg, skV) in
+  out(net, (vid, c, s)).
+
+process
+  TargetVoter | !OtherVoter | !CorruptedVoter
