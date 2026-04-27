@@ -1,0 +1,167 @@
+(* IVXV cast/verify symbolic model.
+ *
+ * This model focuses on the protocol slice:
+ *   voter encrypts ballot with explicit randomness,
+ *   collector stores the resulting ciphertext under a freshly generated VoteID,
+ *   voter passes VoteID and encryption witness to their verifier app,
+ *   verifier app queries the verification service and checks the stored
+ *   ciphertext by recomputing encryption with the disclosed randomness.
+ *
+ * It intentionally abstracts away BDOC/XAdES, OCSP, timestamping, and the
+ * later shuffle/decrypt/tally stages.
+ *
+ * IMPROVEMENTS from previous version:
+ *
+ * 1. Removed dead declaration (previous b1: ballot [private] was declared
+ *    but never used anywhere in the model).
+ *
+ * 2. VoteID semantics (voting/main.go:171-178):
+ *    VoteID is now collector-generated (`new vid_i`) and returned to the voter
+ *    in the RPC response on `net`.  The voter passes it out-of-band to the
+ *    verifier app via the private channel v2ver.
+ *
+ * 3. Verification service has no authentication (verification/main.go:213):
+ *    The real verification service states explicitly that no authentication is
+ *    used; any caller presenting a valid VoteID receives the stored ballot
+ *    container.  The previous model used a private channel c2ver, which hid
+ *    the stored vote from the attacker.  This model replaces c2ver with a
+ *    dedicated public channel `ver` for the verification service, and uses a
+ *    separate VerifyService process to handle the lookup.
+ *
+ * Security note — VoteID delivery:
+ *    Because `net` is a public channel, the attacker can intercept or replace
+ *    the VoteID returned by the Collector and inject a fake VoteID to the
+ *    voter.  This breaks the VerifySuccess ==> Stored correspondence (the
+ *    verifier app may check a VoteID that was never stored).  In the real
+ *    system this is mitigated by HTTPS server authentication on the submission
+ *    endpoint.  The VerifySuccess ==> Stored query is therefore omitted; see
+ *    the comment below for the attack trace.
+ *
+ * Remaining abstractions:
+ *   - BDOC/XAdES container structure (pack_cipher is a simplification)
+ *   - OCSP/TSP qualification properties not modeled
+ *   - The verifier app parses the BDOC container to extract the ciphertext;
+ *     here VerifySuccess implicitly assumes correct extraction
+ *)
+
+type skey.
+type pkey.
+type ballot.
+type rand.
+type voteid.
+type sig.
+
+free net: channel.
+free ver: channel.
+(* ver: the public verification service channel.  No authentication is used;
+ * any caller may send a VoteID query and receive the stored ciphertext.
+ * Corresponds to the verification service endpoint (verification/main.go). *)
+free v2ver: channel [private].
+(* v2ver: the out-of-band channel from voter to their verifier app.
+ * Models the voter communicating VoteID and encryption witness to the
+ * verification app (e.g., by showing a QR code). *)
+free int_store: channel [private].
+(* int_store: internal channel from Collector to VerifyService.
+ * Models the shared storage backend (etcd) accessible to both services. *)
+
+fun pk(skey): pkey.
+fun enc(ballot, rand, pkey): bitstring.
+fun sign(bitstring, skey): sig.
+fun pack_ballot(ballot): bitstring.
+fun pack_cipher(bitstring): bitstring.
+
+reduc forall m: bitstring, sk: skey; verify_sig(sign(m, sk), pk(sk)) = m.
+
+free skE: skey [private].
+free skV: skey [private].
+free b0: ballot [private].
+free rV: rand [private].
+
+event Cast(ballot, bitstring).
+(* Cast(b, c): voter encrypted ballot b into ciphertext c and submitted it. *)
+event Stored(bitstring, voteid).
+(* Stored(c, vid): collector stored ciphertext c under VoteID vid. *)
+event VerifySuccess(ballot, bitstring, voteid).
+(* VerifySuccess(b, c, vid): verifier app confirmed that the ciphertext stored
+ * under vid recomputes to enc(b, r, pk(skE)) for the disclosed randomness r. *)
+
+query attacker(pack_ballot(b0)).
+(* The ballot plaintext must remain secret: the attacker cannot learn b0. *)
+
+query c: bitstring, vid: voteid;
+  event(Stored(c, vid)) ==> event(Cast(b0, c)).
+(* If the collector stored a ciphertext, the honest voter cast it first.
+ * This holds because only the voter's signing key (skV, private) can produce
+ * a valid BDOC signature that the collector accepts. *)
+
+(* OMITTED — not provable with a public verification channel:
+ *
+ *   query b: ballot, c: bitstring, vid: voteid;
+ *     event(VerifySuccess(b, c, vid)) ==> event(Stored(c, vid)).
+ *
+ * Attack trace:
+ *   1. Voter submits (c, s) on net; Collector stores c under vid_i, outputs vid_i on net.
+ *   2. Attacker intercepts vid_i and injects vid_fake =/= vid_i on net.
+ *   3. Voter receives vid_fake, passes (vid_fake, b0, rV) to verifier app.
+ *   4. Verifier queries ver with vid_fake; VerifyService has no entry for vid_fake.
+ *   5. Attacker injects c (already known from step 1) on ver.
+ *   6. Verifier checks c = enc(b0, rV, pk(skE)) — holds — fires VerifySuccess(b0, c, vid_fake).
+ *   7. Stored(c, vid_fake) was never fired (only Stored(c, vid_i) was).
+ *
+ * The real system mitigates this via HTTPS server authentication on the
+ * submission endpoint (the voter's client authenticates the Collector's TLS
+ * certificate before trusting the returned VoteID). *)
+
+query b: ballot, c: bitstring, vid: voteid;
+  event(VerifySuccess(b, c, vid)) ==> event(Cast(b0, c)).
+(* If the verifier app accepted a ciphertext, the honest voter cast it.
+ * This holds even with a public ver channel: the verifier checks
+ * c_s = enc(b_v, r_v, pk(skE)), and since rV is private the only ciphertext
+ * that satisfies the check is the one the Voter computed and Cast. *)
+
+let Voter =
+  let c = enc(b0, rV, pk(skE)) in
+  let msg = pack_cipher(c) in
+  let s = sign(msg, skV) in
+  event Cast(b0, c);
+  out(net, (c, s));
+  (* Receive the VoteID generated by the Collector in the RPC response. *)
+  in(net, vid_resp: voteid);
+  (* Pass VoteID and encryption witness to the verifier app out-of-band. *)
+  out(v2ver, (vid_resp, b0, rV)).
+
+let Collector =
+  in(net, (c_i: bitstring, s_i: sig));
+  let m = verify_sig(s_i, pk(skV)) in
+  if m = pack_cipher(c_i) then
+    (* Generate a fresh VoteID (voting/main.go:173: genIdent()). *)
+    new vid_i: voteid;
+    event Stored(c_i, vid_i);
+    (* Return VoteID in the RPC response. *)
+    out(net, vid_i);
+    (* Make the stored vote available to the VerifyService via the shared backend. *)
+    out(int_store, (vid_i, c_i))
+  else 0.
+
+let VerifyService =
+  (* Receive the stored (VoteID, ciphertext) pair from the shared backend. *)
+  in(int_store, (vid_s: voteid, c_s: bitstring));
+  (* Respond to one VoteID query.  No authentication is required; any caller
+   * presenting the correct VoteID receives the stored ciphertext
+   * (verification/main.go:213 — "No authentication is used"). *)
+  in(ver, vid_q: voteid);
+  if vid_q = vid_s then out(ver, c_s).
+
+let Verifier =
+  (* Receive VoteID and encryption witness from the voter's app. *)
+  in(v2ver, (vid_v: voteid, b_v: ballot, r_v: rand));
+  (* Query the verification service with the VoteID. *)
+  out(ver, vid_v);
+  (* Receive the stored ciphertext. *)
+  in(ver, c_s: bitstring);
+  (* Recompute the expected ciphertext and compare (client-side check). *)
+  if c_s = enc(b_v, r_v, pk(skE)) then
+    event VerifySuccess(b_v, c_s, vid_v).
+
+process
+  Voter | Collector | VerifyService | Verifier

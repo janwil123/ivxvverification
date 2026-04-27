@@ -1,0 +1,59 @@
+(* IVXV cast-phase privacy model.
+ *
+ * This model isolates the pre-verification privacy question:
+ * can an attacker distinguish a cast of ballot b0 from a cast of ballot b1
+ * before the voter releases the encryption randomness?
+ *
+ * The model uses a biprocess via choice[b0,b1], so a positive result is an
+ * observational-equivalence style privacy argument in the symbolic model.
+ *
+ * IMPROVEMENT from previous version:
+ *
+ * Qualification data in RPC response (voting/main.go:199-273):
+ *   The real RPC response includes a Qualification field containing OCSP/TSP
+ *   responses collected after storing the vote.  This qualification data is
+ *   tied to the voter's certificate validity (not the ballot content), so it
+ *   does not reveal the choice.  We model it as a fresh opaque token `qual`
+ *   independent of the ballot, and include it in the output to reflect the
+ *   actual response shape.  Both branches of the biprocess generate qual
+ *   independently with `new`, so observational equivalence is unaffected.
+ *
+ * Remaining abstractions:
+ *   - BDOC/XAdES container structure (pack_cipher is a simplification)
+ *   - OCSP/TSP response content (qual is opaque; timing information omitted)
+ *   - Session authentication not modeled (focus is on encryption randomness)
+ *)
+
+type skey.
+type pkey.
+type ballot.
+type rand.
+type voteid.
+type sig.
+
+free net: channel.
+
+fun pk(skey): pkey.
+fun enc(ballot, rand, pkey): bitstring.
+fun sign(bitstring, skey): sig.
+fun pack_cipher(bitstring): bitstring.
+
+reduc forall m: bitstring, sk: skey; verify_sig(sign(m, sk), pk(sk)) = m.
+
+free skE: skey [private].
+free skV: skey [private].
+free b0: ballot [private].
+free b1: ballot [private].
+
+process
+  new rV: rand;
+  new vid: voteid;
+  new qual: bitstring;
+  (* qual models the OCSP/TSP qualification returned in the response
+   * (voting/main.go:199).  It is fresh and independent of the ballot choice,
+   * so it cannot help the attacker distinguish b0 from b1. *)
+  let b = choice[b0, b1] in
+  let c = enc(b, rV, pk(skE)) in
+  let msg = pack_cipher(c) in
+  let s = sign(msg, skV) in
+  out(net, (vid, c, s, qual))

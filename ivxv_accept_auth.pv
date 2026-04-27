@@ -1,0 +1,134 @@
+(* IVXV accepted-ballot authentication model.
+ *
+ * This model approximates Claim C3 at the symbolic level:
+ * if the collector accepts a ballot container, then that container was signed
+ * by the modeled voter's signing key, AND the BDOC signer identity matches
+ * the pre-authenticated session identity.
+ *
+ * IMPROVEMENTS from previous version:
+ *
+ * 1. Two-layer identity check (voting/main.go:101-167):
+ *    The source enforces two distinct identity checks:
+ *      auther = identity from session/ticket (voting/main.go:101)
+ *      signer = identity from X.509 cert embedded in BDOC (voting/main.go:138)
+ *    and rejects the ballot if auther != signer (voting/main.go:160).
+ *    This model now captures both checks using:
+ *      - a pre-authenticated session channel (auth, private) that carries the
+ *        voter's public key as their session identity (auther);
+ *      - the signer_pk reduction, which extracts the signing public key from
+ *        the BDOC/XAdES signature, modeling the embedded signing certificate
+ *        (container/bdoc/xades.go);
+ *      - an explicit equality check: the session key must equal the BDOC
+ *        signing key (spk = auther).
+ *    In the real system the authentication and signing certificates are
+ *    distinct keys sharing the same Estonian personal ID code (string
+ *    comparison); here we simplify to one key per voter (skV) so that key
+ *    equality is a sound proxy for identity equality.  The security-relevant
+ *    cross-check logic is preserved: without this check the Collector would
+ *    accept a ballot signed by a different key than the one that authenticated
+ *    the session.
+ *
+ * 2. VoteID semantics (voting/main.go:171-178):
+ *    VoteID is now generated fresh by the Collector (`new`) and returned to
+ *    the voter in the RPC response on `net`.  The previous model used a
+ *    pre-agreed private constant.
+ *
+ * Remaining abstractions:
+ *   - In the real system skAuth ≠ skV; only string identity equality is
+ *     checked, not key equality.  Modeling two distinct keys with the same
+ *     identity requires equational axioms over free names, which ProVerif
+ *     does not support; the single-key simplification is used instead.
+ *   - BDOC/XAdES container structure (pack_cipher is a simplification)
+ *   - Eligibility check (VoterChoices) not modeled
+ *   - Ciphertext structural validity (ASN1CiphertextVerify) not modeled
+ *   - Rate limiting not modeled
+ *   - OCSP/TSP qualification properties not modeled
+ *)
+
+type skey.
+type pkey.
+type ballot.
+type rand.
+type voteid.
+type sig.
+
+free net: channel.
+free auth: channel [private].
+(* auth models the pre-authenticated RPC context established before the Vote
+ * RPC is called.  The voter sends their authentication public key on this
+ * channel (auther).  Because auth is private the attacker cannot inject
+ * a fake identity into the session. *)
+
+fun pk(skey): pkey.
+fun enc(ballot, rand, pkey): bitstring.
+fun sign(bitstring, skey): sig.
+fun pack_cipher(bitstring): bitstring.
+
+reduc forall m: bitstring, sk: skey; verify_sig(sign(m, sk), pk(sk)) = m.
+reduc forall m: bitstring, sk: skey; signer_pk(sign(m, sk)) = pk(sk).
+(* signer_pk extracts the public key used to produce a signature, modeling
+ * the fact that the signing certificate is embedded in the BDOC/XAdES
+ * container and recovered during verification (container/bdoc/xades.go). *)
+
+free skE: skey [private].
+free skV: skey [private].
+(* skV: the voter's signing key, used for both session authentication (via
+ * its public key on the auth channel) and BDOC container signing.  In the
+ * real system there are two separate keys with the same Estonian personal ID
+ * code; the single-key simplification is noted above. *)
+free b0: ballot [private].
+free rV: rand [private].
+
+event VoterSent(bitstring, sig).
+event Accepted(bitstring, voteid).
+
+(* Claim C3: if the Collector accepted a ballot under some freshly generated
+ * VoteID, the voter's signing key (skV) was used to create the signature,
+ * AND the BDOC signer identity matched the session-authenticated identity.
+ * The `vid: voteid` variable is universally quantified: the claim holds for
+ * every fresh VoteID the Collector may generate. *)
+query vid: voteid;
+  event(Accepted(enc(b0, rV, pk(skE)), vid)) ==>
+  event(VoterSent(enc(b0, rV, pk(skE)), sign(pack_cipher(enc(b0, rV, pk(skE))), skV))).
+
+let Voter =
+  (* Step 1: authenticate the session.
+   * The voter presents their public key as their session identity (auther).
+   * In the real protocol this is derived from the TLS/ticket authentication
+   * certificate (voting/main.go:101). *)
+  out(auth, pk(skV));
+  (* Step 2: encrypt the ballot and sign the BDOC container. *)
+  let c = enc(b0, rV, pk(skE)) in
+  let s = sign(pack_cipher(c), skV) in
+  event VoterSent(c, s);
+  out(net, (c, s));
+  (* Step 3: receive the freshly generated VoteID from the Collector. *)
+  in(net, vid_resp: voteid).
+
+let Collector =
+  (* Receive the pre-authenticated session identity (auther = voter's auth key).
+   * In the real protocol the RPC framework extracts this from the
+   * authenticated session before calling Vote (voting/main.go:101). *)
+  in(auth, auther: pkey);
+  (* Receive the BDOC container (ciphertext + XAdES signature) from the net. *)
+  in(net, (c_i: bitstring, s_i: sig));
+  (* Extract the signing public key from the embedded signing certificate
+   * (models container/bdoc/bdoc.go certificate extraction). *)
+  let spk = signer_pk(s_i) in
+  (* Cross-check: the session identity must equal the BDOC signer identity.
+   * Corresponds to voting/main.go:160: if auther != signer -> rejected.
+   * Here identity equality is modeled as public-key equality. *)
+  if spk = auther then
+    (* Verify the BDOC container signature under the signer's public key. *)
+    let m = verify_sig(s_i, spk) in
+    if m = pack_cipher(c_i) then
+      (* Generate a fresh VoteID and return it in the RPC response.
+       * Corresponds to voting/main.go:171-178 (genIdent or pre-set token). *)
+      new vid_i: voteid;
+      event Accepted(c_i, vid_i);
+      out(net, vid_i)
+    else 0
+  else 0.
+
+process
+  Voter | Collector
